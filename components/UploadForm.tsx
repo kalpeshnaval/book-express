@@ -2,9 +2,9 @@
 
 import { useRef, useState, type RefObject } from "react";
 import { zodResolver } from "@hookform/resolvers/zod";
+import { useAuth } from "@clerk/nextjs";
 import { ImagePlus, Upload, X } from "lucide-react";
 import { useForm } from "react-hook-form";
-import { z } from "zod";
 
 import LoadingOverlay from "@/components/LoadingOverlay";
 import {
@@ -15,105 +15,47 @@ import {
   FormLabel,
   FormMessage,
 } from "@/components/ui/form";
-
-const maxPdfSize = 50 * 1024 * 1024;
-
-const voices = {
-  male: [
-    {
-      value: "dave",
-      name: "Dave",
-      description: "Young male, British-Essex, casual & conversational",
-    },
-    {
-      value: "daniel",
-      name: "Daniel",
-      description: "Middle-aged male, British, authoritative but warm",
-    },
-    {
-      value: "chris",
-      name: "Chris",
-      description: "Male, casual & easy-going",
-    },
-  ],
-  female: [
-    {
-      value: "rachel",
-      name: "Rachel",
-      description: "Young female, American, calm & clear",
-    },
-    {
-      value: "sarah",
-      name: "Sarah",
-      description: "Young female, American, soft & approachable",
-    },
-  ],
-} as const;
-
-const voiceValues = [
-  ...voices.male.map((voice) => voice.value),
-  ...voices.female.map((voice) => voice.value),
-] as const;
-
-const uploadSchema = z.object({
-  pdf: z
-    .custom<File | undefined>((value) => value === undefined || value instanceof File, {
-      message: "Please upload a PDF file.",
-    })
-    .refine((file) => file instanceof File, {
-      message: "Please upload a PDF file.",
-    })
-    .refine((file) => !file || file.type === "application/pdf", {
-      message: "Only PDF files are supported.",
-    })
-    .refine((file) => !file || file.size <= maxPdfSize, {
-      message: "PDF file must be 50MB or smaller.",
-    }),
-  coverImage: z
-    .custom<File | undefined>(
-      (value) => value === undefined || value instanceof File,
-      {
-        message: "Cover image must be a valid file.",
-      }
-    )
-    .refine((file) => !file || file.type.startsWith("image/"), {
-      message: "Cover image must be an image file.",
-    })
-    .optional(),
-  title: z.string().trim().min(1, "Title is required."),
-  author: z.string().trim().min(1, "Author name is required."),
-  voice: z.enum(voiceValues),
-});
-
-type UploadFormInput = z.input<typeof uploadSchema>;
-type UploadFormValues = z.output<typeof uploadSchema>;
+import {
+  checkBookExists,
+  createBook,
+  saveBookSegments,
+} from "@/lib/actions/book.action";
+import { toast } from "sonner";
+import { useRouter } from "next/navigation";
+import { parsePDFFile } from "@/lib/utils";
+import { upload } from "@vercel/blob/client";
+import { DEFAULT_VOICE, voiceCategories, voiceOptions } from "@/lib/constants";
+import { UploadSchema } from "@/lib/zod";
+import type { BookUploadFormValues, BookUploadSubmitValues } from "@/types";
 
 type FileDropzoneProps = {
   accept: string;
-  file?: File;
+  files?: File[];
   hint: string;
   icon: typeof Upload;
   inputRef: RefObject<HTMLInputElement | null>;
-  onChange: (file?: File) => void;
+  onChange: (files: File[]) => void;
   prompt: string;
 };
 
 function FileDropzone({
   accept,
-  file,
+  files,
   hint,
   icon: Icon,
   inputRef,
   onChange,
   prompt,
 }: FileDropzoneProps) {
+  const file = files?.[0];
+
   return (
     <div className={file ? "upload-dropzone upload-dropzone-uploaded" : "upload-dropzone"}>
       <input
         ref={inputRef}
         accept={accept}
         className="hidden"
-        onChange={(event) => onChange(event.target.files?.[0])}
+        onChange={(event) => onChange(event.target.files ? Array.from(event.target.files) : [])}
         type="file"
       />
 
@@ -137,7 +79,7 @@ function FileDropzone({
             aria-label={`Remove ${file.name}`}
             className="upload-dropzone-remove"
             onClick={() => {
-              onChange(undefined);
+              onChange([]);
 
               if (inputRef.current) {
                 inputRef.current.value = "";
@@ -158,29 +100,120 @@ export default function UploadForm() {
   const pdfInputRef = useRef<HTMLInputElement>(null);
   const coverInputRef = useRef<HTMLInputElement>(null);
 
-  const form = useForm<UploadFormInput, unknown, UploadFormValues>({
-    resolver: zodResolver(uploadSchema),
+  const router = useRouter();
+  const { userId } = useAuth();
+
+  const form = useForm<BookUploadFormValues, unknown, BookUploadSubmitValues>({
+    resolver: zodResolver(UploadSchema),
     defaultValues: {
-      pdf: undefined,
-      coverImage: undefined,
+      pdfFile: [],
+      coverImage: [],
       title: "",
       author: "",
-      voice: "rachel",
+      voice: DEFAULT_VOICE,
     },
   });
 
-  async function onSubmit(values: UploadFormValues) {
+  async function onSubmit(data: BookUploadSubmitValues) {
     setIsSubmitting(true);
 
     try {
-      await new Promise((resolve) => setTimeout(resolve, 1200));
-      console.log("Book upload payload", values);
+      if (!userId) {
+        toast.error("Please sign in to upload a book.");
+        return;
+      }
+
+      const existsCheck = await checkBookExists(data.title);
+      if (existsCheck.exists && existsCheck.data?.slug) {
+        toast.info("Book already exists");
+        form.reset();
+        router.push(`/books/${existsCheck.data.slug}`);
+        return;
+      }
+
+      const fileTitle = data.title.replace(/\s+/g, "-").toLowerCase();
+      const pdfFile = data.pdfFile[0];
+      const parsedPDF = await parsePDFFile(pdfFile);
+
+      if (parsedPDF.content.length === 0) {
+        toast.error("Failed to parse PDF");
+        return;
+      }
+
+      const uploadedPdfBlob = await upload(fileTitle, pdfFile, {
+        access: "public",
+        handleUploadUrl: "/api/upload",
+        contentType: "application/pdf",
+      });
+
+      let coverUrl: string;
+      let coverBlobKey: string | undefined;
+
+      if (data.coverImage && data.coverImage.length > 0) {
+        const coverFile = data.coverImage[0];
+        const uploadedCoverBlob = await upload(`${fileTitle}_cover.png`, coverFile, {
+          access: "public",
+          handleUploadUrl: "/api/upload",
+          contentType: coverFile.type,
+        });
+
+        coverUrl = uploadedCoverBlob.url;
+        coverBlobKey = uploadedCoverBlob.pathname;
+      } else {
+        const response = await fetch(parsedPDF.cover);
+        const blob = await response.blob();
+        const uploadedCoverBlob = await upload(`${fileTitle}_cover.png`, blob, {
+          access: "public",
+          handleUploadUrl: "/api/upload",
+          contentType: "image/png",
+        });
+
+        coverUrl = uploadedCoverBlob.url;
+        coverBlobKey = uploadedCoverBlob.pathname;
+      }
+
+      const book = await createBook({
+        clerkId: userId,
+        title: data.title,
+        author: data.author,
+        persona: data.voice,
+        fileURL: uploadedPdfBlob.url,
+        fileBlobKey: uploadedPdfBlob.pathname,
+        coverURL: coverUrl,
+        coverBlobKey,
+        fileSize: pdfFile.size,
+      });
+
+      if (!book.success || !book.data?._id) {
+        toast.error("Failed to create book.");
+        return;
+      }
+
+      const segmentsResult = await saveBookSegments(
+        book.data._id,
+        userId,
+        parsedPDF.content
+      );
+
+      if (!segmentsResult.success) {
+        toast.error("Book was created, but segments could not be saved.");
+        return;
+      }
+
+      console.log("Book upload payload", {
+        ...data,
+        bookId: book.data._id,
+        coverUrl,
+        fileUrl: uploadedPdfBlob.url,
+      });
+
+      toast.success("Book created successfully.");
       form.reset({
-        pdf: undefined,
-        coverImage: undefined,
+        pdfFile: [],
+        coverImage: [],
         title: "",
         author: "",
-        voice: "rachel",
+        voice: DEFAULT_VOICE,
       });
 
       if (pdfInputRef.current) {
@@ -190,6 +223,8 @@ export default function UploadForm() {
       if (coverInputRef.current) {
         coverInputRef.current.value = "";
       }
+
+      router.push(`/books/${book.data.slug}`);
     } finally {
       setIsSubmitting(false);
     }
@@ -207,18 +242,18 @@ export default function UploadForm() {
           >
             <FormField
               control={form.control}
-              name="pdf"
+              name="pdfFile"
               render={({ field }) => (
                 <FormItem>
                   <FormLabel className="form-label">Book PDF File</FormLabel>
                   <FormControl>
                     <FileDropzone
                       accept="application/pdf"
-                      file={field.value}
+                      files={field.value}
                       hint="PDF file (max 50MB)"
                       icon={Upload}
                       inputRef={pdfInputRef}
-                      onChange={(file) => field.onChange(file)}
+                      onChange={field.onChange}
                       prompt="Click to upload PDF"
                     />
                   </FormControl>
@@ -236,11 +271,11 @@ export default function UploadForm() {
                   <FormControl>
                     <FileDropzone
                       accept="image/*"
-                      file={field.value}
+                      files={field.value}
                       hint="Leave empty to auto-generate from PDF"
                       icon={ImagePlus}
                       inputRef={coverInputRef}
-                      onChange={(file) => field.onChange(file)}
+                      onChange={field.onChange}
                       prompt="Click to upload cover image"
                     />
                   </FormControl>
@@ -296,8 +331,9 @@ export default function UploadForm() {
                       <div className="space-y-3">
                         <p className="text-sm font-medium text-[#7a6e63]">Male Voices</p>
                         <div className="voice-selector-options flex-col md:grid md:grid-cols-3">
-                          {voices.male.map((voice) => {
-                            const selected = field.value === voice.value;
+                          {voiceCategories.male.map((voiceKey) => {
+                            const voice = voiceOptions[voiceKey];
+                            const selected = field.value === voiceKey;
 
                             return (
                               <label
@@ -306,15 +342,15 @@ export default function UploadForm() {
                                     ? "voice-selector-option-selected"
                                     : "voice-selector-option-default"
                                 }`}
-                                key={voice.value}
+                                key={voiceKey}
                               >
                                 <input
                                   checked={selected}
                                   className="sr-only"
                                   name={field.name}
-                                  onChange={() => field.onChange(voice.value)}
+                                  onChange={() => field.onChange(voiceKey)}
                                   type="radio"
-                                  value={voice.value}
+                                  value={voiceKey}
                                 />
                                 <span className="mt-1 size-3 rounded-full border border-[#cbb99f] bg-white shadow-inner">
                                   <span
@@ -340,8 +376,9 @@ export default function UploadForm() {
                       <div className="space-y-3">
                         <p className="text-sm font-medium text-[#7a6e63]">Female Voices</p>
                         <div className="voice-selector-options flex-col md:grid md:grid-cols-2">
-                          {voices.female.map((voice) => {
-                            const selected = field.value === voice.value;
+                          {voiceCategories.female.map((voiceKey) => {
+                            const voice = voiceOptions[voiceKey];
+                            const selected = field.value === voiceKey;
 
                             return (
                               <label
@@ -350,15 +387,15 @@ export default function UploadForm() {
                                     ? "voice-selector-option-selected"
                                     : "voice-selector-option-default"
                                 }`}
-                                key={voice.value}
+                                key={voiceKey}
                               >
                                 <input
                                   checked={selected}
                                   className="sr-only"
                                   name={field.name}
-                                  onChange={() => field.onChange(voice.value)}
+                                  onChange={() => field.onChange(voiceKey)}
                                   type="radio"
-                                  value={voice.value}
+                                  value={voiceKey}
                                 />
                                 <span className="mt-1 size-3 rounded-full border border-[#cbb99f] bg-white shadow-inner">
                                   <span
