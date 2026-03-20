@@ -63,7 +63,7 @@ export default function LibraryHero() {
               </p>
             </div>
 
-            <Link href="/book/new" className="library-cta-primary">
+            <Link href="/books/new" className="library-cta-primary">
               <Plus className="size-5 stroke-[2.5]" />
               <span>Add new book</span>
             </Link>

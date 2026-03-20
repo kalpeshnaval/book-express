@@ -225,6 +225,15 @@ export default function UploadForm() {
       }
 
       router.push(`/books/${book.data.slug}`);
+    } catch (error) {
+      console.error("Book upload failed:", error);
+
+      const message =
+        error instanceof Error
+          ? error.message
+          : "Something went wrong while uploading the book.";
+
+      toast.error(message);
     } finally {
       setIsSubmitting(false);
     }

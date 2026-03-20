@@ -12,6 +12,13 @@ export async function POST(request: Request): Promise<NextResponse> {
   const body = (await request.json()) as HandleUploadBody;
 
   try {
+    if (!process.env.BLOB_READ_WRITE_TOKEN) {
+      return NextResponse.json(
+        { error: "BLOB_READ_WRITE_TOKEN is not configured." },
+        { status: 500 }
+      );
+    }
+
     const jsonResponse = await handleUpload({
       body,
       request,
